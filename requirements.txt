@@ -1,0 +1,28 @@
+# LangChain core & graph
+langchain
+langchain-core
+langchain-openai
+langgraph
+
+# Web tools & document loader
+langchain-community
+duckduckgo-search
+
+# Tài chính & phân tích kỹ thuật
+vnstock
+pandas
+pandas-ta
+numpy==1.24.4  # ⚠️ Bắt buộc: pandas-ta cần numpy bản này
+
+# Trích xuất nội dung web
+beautifulsoup4
+html5lib
+requests
+
+# Streamlit UI
+streamlit
+
+# Tiện ích bổ sung (tuỳ chọn)
+python-dotenv
+PyYAML
+yfinance

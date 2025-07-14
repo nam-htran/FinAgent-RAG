@@ -1,0 +1,295 @@
+
+===== ./app.py =====
+import streamlit as st
+from langchain_core.messages import BaseMessage
+from fin_agent.graph import stream_agent_with_system_prompt
+
+st.set_page_config(page_title="FinAgent Pro", layout="wide")
+st.title("FinAgent Pro")
+st.caption("An AI Agent for financial analysis of U.S. companies (Powered by LangGraph & Streamlit)")
+
+if "messages" not in st.session_state:
+    st.session_state.messages = [{
+        "role": "assistant",
+        "content": "How can I assist you? Ask about a specific company (e.g., Apple, Tesla)."
+    }]
+
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+if prompt := st.chat_input("e.g., Summarize Apple's latest annual report and technical analysis?"):
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    with st.chat_message("assistant"):
+        def response_generator():
+            stream = stream_agent_with_system_prompt(prompt)
+            final_response_content = ""
+            for chunk in stream:
+                if "agent" in chunk:
+                    agent_messages = chunk["agent"].get("messages", [])
+                    if agent_messages and isinstance(agent_messages[0], BaseMessage) and agent_messages[0].content:
+                        new_content = agent_messages[0].content
+                        if len(new_content) > len(final_response_content):
+                            delta = new_content[len(final_response_content):]
+                            if delta.strip():
+                                yield delta
+                                final_response_content = new_content
+
+        try:
+            with st.spinner("Loading, wait..."):
+                full_response = st.write_stream(response_generator)
+            st.session_state.messages.append({"role": "assistant", "content": full_response})
+        except Exception as e:
+            error_message = f"Error: {e}"
+            st.error(error_message)
+            st.session_state.messages.append({"role": "assistant", "content": error_message})
+
+
+===== ./fin_agent/graph.py =====
+import operator
+import os
+from typing import TypedDict, Annotated, Sequence
+from dotenv import load_dotenv
+import streamlit as st
+
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, ToolMessage, AIMessage
+from langchain_openai import ChatOpenAI
+from langgraph.graph import StateGraph, END
+
+from .tools.stock_tools import get_stock_data, calculate_technical_indicators
+from .tools.web_tools import read_webpage
+from .tools.sec_tools import get_company_info, get_latest_sec_filings
+
+load_dotenv()
+
+class AgentState(TypedDict):
+    messages: Annotated[Sequence[BaseMessage], operator.add]
+
+system_prompt = """You are a financial analyst AI specialized in U.S. companies. 
+Use the provided tools to retrieve SEC filings and technical indicators.
+Always:
+1. Retrieve CIK using `get_company_info`.
+2. Fetch 10-K or 10-Q reports with `get_latest_sec_filings`.
+3. Get stock data with `get_stock_data`, then calculate indicators using `calculate_technical_indicators`.
+4. Summarize the insights in concise English.
+"""
+
+all_tools = [
+    get_stock_data, calculate_technical_indicators,
+    get_company_info, get_latest_sec_filings, read_webpage
+]
+tool_map = {tool.name: tool for tool in all_tools}
+
+def call_tool_node(state: AgentState):
+    tool_calls = state['messages'][-1].tool_calls
+    tool_messages = []
+
+    for tool_call in tool_calls:
+        tool_name = tool_call['name']
+        tool_input = tool_call['args']
+        tool = tool_map.get(tool_name)
+
+        if tool is None:
+            output = f"❌ Không tìm thấy tool '{tool_name}'"
+        else:
+            output = tool.invoke(tool_input)
+
+        tool_messages.append(ToolMessage(content=str(output), tool_call_id=tool_call['id']))
+
+    return {"messages": tool_messages}
+
+llm = ChatOpenAI(
+    model="deepseek/deepseek-chat",
+    temperature=0,
+    max_tokens=2048,
+    openai_api_key=os.getenv("OPENROUTER_API_KEY"),
+    openai_api_base="https://openrouter.ai/api/v1",
+).bind_tools(all_tools)
+
+def call_model(state: AgentState):
+    response = llm.invoke(state['messages'])
+    return {"messages": [response]}
+
+workflow = StateGraph(AgentState)
+workflow.add_node("agent", call_model)
+workflow.add_node("action", call_tool_node)
+workflow.set_entry_point("agent")
+workflow.add_conditional_edges("agent", lambda s: "end" if not s['messages'][-1].tool_calls else "continue", {"continue": "action", "end": END})
+workflow.add_edge("action", "agent")
+
+app_graph = workflow.compile()
+
+def run_agent_with_system_prompt(user_input):
+    recent_messages = [
+        m for m in st.session_state.get("messages", [])
+        if m["role"] in {"user", "assistant"}
+    ][-5:]
+
+    history = []
+    for m in recent_messages:
+        if m["role"] == "user":
+            history.append(HumanMessage(content=m["content"]))
+        elif m["role"] == "assistant":
+            history.append(SystemMessage(content=m["content"]))  # Hoặc AIMessage nếu bạn phân biệt rõ
+
+    messages = [
+        SystemMessage(content=system_prompt),
+        *history,
+        HumanMessage(content=user_input),
+    ]
+
+    result = app_graph.invoke({"messages": messages})
+    return result
+
+def stream_agent_with_system_prompt(user_input: str):
+    messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_input)
+    ]
+    return app_graph.stream({"messages": messages})
+
+
+===== ./fin_agent/__init__.py =====
+
+
+===== ./fin_agent/tools/web_tools.py =====
+import os
+import requests
+from bs4 import BeautifulSoup
+from langchain.tools import tool
+
+@tool
+def read_webpage(url: str) -> str:
+    """Read the content of a webpage from a given URL and return the text (truncated if too long)."""
+    try:
+        headers = {
+            "User-Agent": os.getenv("USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        response = requests.get(url, headers=headers, timeout=10)
+
+        if response.status_code == 403 and url.endswith("-index.htm"):
+            txt_url = url.replace("-index.htm", ".txt")
+            txt_resp = requests.get(txt_url, headers=headers, timeout=10)
+            if txt_resp.status_code == 200:
+                return txt_resp.text[:5000] + "\n...\n[Truncated]"
+            else:
+                return f"[403] Access denied. Tried fallback URL: {txt_url} (status: {txt_resp.status_code})"
+
+        if response.status_code != 200:
+            return f"[HTTP Error {response.status_code}] {response.text[:300]}"
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        body_text = soup.get_text(separator="\n")
+
+        return body_text[:5000] + "\n...\n[Truncated]" if len(body_text) > 5000 else body_text.strip()
+
+    except Exception as e:
+        return f"[Error reading page: {e}]"
+
+
+===== ./fin_agent/tools/stock_tools.py =====
+import pandas as pd
+import pandas_ta as ta
+from langchain.tools import tool
+from vnstock import Vnstock
+from io import StringIO
+
+@tool
+def get_stock_data(ticker: str, start_date: str, end_date: str) -> str:
+    """Lấy dữ liệu giá cổ phiếu theo ngày."""
+    try:
+        stock = Vnstock().stock(symbol=ticker.upper(), source="VCI")
+        df = stock.quote.history(start=start_date, end=end_date, interval="1D")
+        if df.empty:
+            return f"Không có dữ liệu giá cho mã {ticker}."
+        df['time'] = pd.to_datetime(df['time']).dt.strftime('%Y-%m-%d')
+        return df[['time', 'open', 'high', 'low', 'close', 'volume']].to_csv(index=False)
+    except Exception as e:
+        return f"Lỗi khi lấy dữ liệu giá: {e}"
+
+@tool
+def calculate_technical_indicators(csv_data: str) -> str:
+    """
+    Tính toán các chỉ báo kỹ thuật (RSI, MACD, SMA) từ dữ liệu CSV giá cổ phiếu.
+    """
+    try:
+        df = pd.read_csv(StringIO(csv_data))
+        if 'close' not in df.columns:
+            return "Dữ liệu CSV không hợp lệ."
+        df.ta.rsi(close='close', append=True, length=14)
+        df.ta.macd(close='close', append=True, fast=12, slow=26, signal=9)
+        df.ta.sma(close='close', append=True, length=50)
+        latest = df.iloc[-1][['RSI_14', 'MACD_12_26_9', 'SMA_50']]
+        return f"Các chỉ báo kỹ thuật gần nhất:\n{latest.to_string()}"
+    except Exception as e:
+        return f"Lỗi khi tính chỉ báo kỹ thuật: {e}"
+
+
+===== ./fin_agent/tools/sec_tools.py =====
+# fin_agent/tools/sec_tools.py
+import requests
+import json
+from langchain.tools import tool
+
+USER_AGENT = 'namthse182380@fpt.edu.vn'
+
+@tool
+def get_company_info(company_name_or_ticker: str) -> str:
+    """Lấy mã CIK của công ty Mỹ từ SEC. Cần thiết để dùng các tool SEC khác."""
+    headers = {'User-Agent': USER_AGENT}
+    try:
+        response = requests.get("https://www.sec.gov/files/company_tickers.json", headers=headers)
+        response.raise_for_status()
+        companies = response.json()
+        for key, value in companies.items():
+            if value['ticker'].lower()dê == company_name_or_ticker.lower() or value['title'].lower() == company_name_or_ticker.lower():
+                cik_str = str(value['cik_str']).zfill(10)
+                return json.dumps({"ticker": value['ticker'], "company_name": value['title'], "cik": cik_str})
+        return f"Không tìm thấy thông tin cho: {company_name_or_ticker}"
+    except Exception as e:
+        return f"Lỗi: {e}"
+
+@tool
+def get_latest_sec_filings(cik: str, form_type: str = "10-K") -> str:
+    """Lấy danh sách các báo cáo gần nhất (10-K cho năm, 10-Q cho quý) của một công ty Mỹ."""
+    headers = {'User-Agent': USER_AGENT}
+    try:
+        response = requests.get(f"https://data.sec.gov/submissions/CIK{cik}.json", headers=headers)
+        response.raise_for_status()
+        data = response.json()
+        recent_filings = data['filings']['recent']
+        filings_by_type = []
+        for i in range(len(recent_filings['form'])):
+            if recent_filings['form'][i] == form_type:
+                filings_by_type.append({
+                    "accession_number": recent_filings['accessionNumber'][i],
+                    "filing_date": recent_filings['filingDate'][i],
+                    "report_date": recent_filings['reportDate'][i],
+                    "url": f"https://www.sec.gov/Archives/edgar/data/{cik.lstrip('0')}/{recent_filings['accessionNumber'][i].replace('-', '')}/{recent_filings['primaryDocument'][i]}"
+                })
+        if not filings_by_type: return f"Không tìm thấy báo cáo {form_type} cho CIK {cik}."
+        return json.dumps(filings_by_type[:5])
+    except Exception as e:
+        return f"Lỗi: {e}"
+
+===== ./fin_agent/tools/__init__.py =====
+
+
+===== DIRECTORY TREE =====
+./
+    requirements.txt
+    README.md
+    app.py
+    data/
+    fin_agent/
+        graph.py
+        __init__.py
+        tools/
+            web_tools.py
+            stock_tools.py
+            sec_tools.py
+            __init__.py
