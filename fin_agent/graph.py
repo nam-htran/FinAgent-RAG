@@ -1,7 +1,9 @@
 import operator
 import os
-from typing import TypedDict, Annotated, Sequence
+from typing import TypedDict, Annotated, Sequence, Optional
 from dotenv import load_dotenv
+import datetime
+import json
 
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, ToolMessage, AIMessage
 from langchain_openai import ChatOpenAI
@@ -13,25 +15,46 @@ from .tools.sec_tools import get_company_info, get_latest_sec_filings
 
 load_dotenv()
 
+# --- AGENTSTATE NÂNG CẤP ---
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], operator.add]
+    # Thêm các trường để lưu dữ liệu lớn, tránh làm đầy context window
+    company_info: Optional[dict]
+    stock_csv_data: Optional[str]
+    filing_content: Optional[str]
 
-# System prompt đã được tối ưu để agent tuân thủ quy trình chặt chẽ
-system_prompt = """You are an expert financial analyst AI for U.S. companies. You must follow a strict workflow and chain your tool calls together. Do not explain your steps, just execute them.
 
-**Workflow:**
+# --- SYSTEM PROMPT ĐÃ ĐƯỢC TỐI ƯU HÓA ---
+system_prompt = """You are a `Sequential Tool-Calling Bot`. You MUST follow the steps below in order, ONE AT A TIME.
+Your response MUST ALWAYS be a single tool call, until the final step.
 
-1.  **Get Company Info:** Start by calling the `get_company_info` tool with the company's name or ticker.
+**Workflow Protocol: Execute ONE step at a time.**
 
-2.  **Extract CIK and Get Filings:** From the JSON output of `get_company_info`, you MUST extract the `cik` value. Immediately use this `cik` to call the `get_latest_sec_filings` tool to find the most recent '10-K' report.
+**Step 1: Get Company Info**
+- Action: Call `get_company_info`.
 
-3.  **Get Stock Data:** Use the company's ticker symbol to call `get_stock_data`. Fetch data for the last 365 days.
+**Step 2: Get SEC Filings**
+- Prerequisite: Step 1 complete.
+- Action: Call `get_latest_sec_filings` using the `cik` from Step 1.
 
-4.  **Calculate Indicators:** Take the CSV data from the output of `get_stock_data` and pass it directly to the `calculate_technical_indicators` tool.
+**Step 3: Get Stock Data**
+- Prerequisite: Step 1 complete.
+- Action: Call `get_stock_data` using the `ticker` from Step 1 for the last 365 days.
 
-5.  **Read Filing and Summarize:** After you have the URL for the 10-K report, use the `read_webpage` tool to read its content.
+**Step 4: Calculate Technical Indicators**
+- Prerequisite: Step 3 complete.
+- Action: Call `calculate_technical_indicators`. **Input for this tool is handled automatically.**
 
-6.  **Final Report:** Only after all previous steps are complete, synthesize all the information gathered (10-K summary, and technical indicators) into a single, concise final report in English. Do not present results individually.
+**Step 5: Read Filing Content**
+- Prerequisite: Step 2 complete.
+- Action: Call `read_webpage` using the `url` from Step 2.
+
+**Step 6: FINAL REPORT**
+- Prerequisite: ALL previous steps complete.
+- Action: Synthesize all information into a final report. This is the ONLY time you generate text.
+
+**Error Handling:**
+- If a tool returns an error, STOP and report the error to the user.
 """
 
 # --- Định nghĩa Tools và LLM ---
@@ -41,34 +64,59 @@ all_tools = [
 ]
 tool_map = {tool.name: tool for tool in all_tools}
 
-# Model được đề xuất để có kết quả tốt nhất (yêu cầu tài khoản trả phí trên OpenRouter)
-# Bạn có thể thử các model khác, nhưng chúng có thể không tuân thủ quy trình tốt bằng.
 llm = ChatOpenAI(
-    model="deepseek/deepseek-chat",
+    model="deepseek/deepseek-chat-v3-0324:free",
     temperature=0,
-    max_tokens=1024,
+    max_tokens=2048,
     openai_api_key=os.getenv("OPENROUTER_API_KEY"),
     openai_api_base="https://openrouter.ai/api/v1",
 ).bind_tools(all_tools)
 
 # --- Các Node của Graph ---
+def call_model(state: AgentState):
+    response = llm.invoke(state['messages'])
+    return {"messages": [response]}
+
 def call_tool_node(state: AgentState):
     tool_calls = state['messages'][-1].tool_calls
     tool_messages = []
+    
+    # Tạo một dict để cập nhật state sau khi chạy tools
+    state_updates = {}
+
     for tool_call in tool_calls:
         tool_name = tool_call['name']
         tool_input = tool_call['args']
         tool = tool_map.get(tool_name)
+        
         if tool is None:
             output = f"Error: Tool '{tool_name}' not found."
-        else:
-            output = tool.invoke(tool_input)
-        tool_messages.append(ToolMessage(content=str(output), tool_call_id=tool_call['id']))
-    return {"messages": tool_messages}
+            tool_messages.append(ToolMessage(content=str(output), tool_call_id=tool_call['id']))
+            continue
 
-def call_model(state: AgentState):
-    response = llm.invoke(state['messages'])
-    return {"messages": [response]}
+        # --- LOGIC MỚI: XỬ LÝ DỮ LIỆU LỚN ---
+        # Nếu là tool tính toán, lấy dữ liệu từ state thay vì từ input
+        if tool_name == 'calculate_technical_indicators':
+            tool_input['csv_data'] = state['stock_csv_data']
+        
+        output = tool.invoke(tool_input)
+
+        # Lưu kết quả của các tool quan trọng vào state thay vì messages
+        if tool_name == 'get_company_info':
+            state_updates['company_info'] = json.loads(output)
+            tool_messages.append(ToolMessage(content="Successfully retrieved company info.", tool_call_id=tool_call['id']))
+        elif tool_name == 'get_stock_data':
+            state_updates['stock_csv_data'] = output
+            tool_messages.append(ToolMessage(content="Successfully retrieved stock data. Ready to calculate indicators.", tool_call_id=tool_call['id']))
+        elif tool_name == 'read_webpage':
+            state_updates['filing_content'] = output
+            tool_messages.append(ToolMessage(content="Successfully read filing content.", tool_call_id=tool_call['id']))
+        else:
+            # Các tool khác trả về kết quả bình thường
+            tool_messages.append(ToolMessage(content=str(output), tool_call_id=tool_call['id']))
+
+    state_updates["messages"] = tool_messages
+    return state_updates
 
 # --- Xây dựng Graph ---
 workflow = StateGraph(AgentState)
@@ -83,24 +131,27 @@ workflow.add_conditional_edges(
 workflow.add_edge("action", "agent")
 app_graph = workflow.compile()
 
-
 # --- Hàm chạy chính sử dụng invoke ---
 def run_agent_chain(user_input: str, history: list):
-    """
-    Runs the entire agent chain from start to finish using invoke().
-    """
     langchain_history = []
+    initial_messages = []
     for msg in history:
         if msg["role"] == "user":
-            langchain_history.append(HumanMessage(content=msg["content"]))
+            initial_messages.append(HumanMessage(content=msg["content"]))
         elif msg["role"] == "assistant":
-            langchain_history.append(AIMessage(content=msg["content"]))
-
-    messages = [
+            initial_messages.append(AIMessage(content=msg["content"]))
+            
+    initial_messages.extend([
         SystemMessage(content=system_prompt),
-        *langchain_history,
         HumanMessage(content=user_input)
-    ]
+    ])
     
-    # Sử dụng invoke để chạy toàn bộ chuỗi và chờ kết quả
-    return app_graph.invoke({"messages": messages})
+    # Khởi tạo state với các trường rỗng
+    initial_state = {
+        "messages": initial_messages,
+        "company_info": None,
+        "stock_csv_data": None,
+        "filing_content": None,
+    }
+    
+    return app_graph.invoke(initial_state)

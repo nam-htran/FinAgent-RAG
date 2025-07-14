@@ -1,7 +1,6 @@
 import streamlit as st
 from langchain_core.messages import AIMessage, HumanMessage
-# DÒNG IMPORT ĐÃ ĐƯỢC SỬA LỖI:
-from fin_agent.graph import run_agent_chain 
+from fin_agent.graph import run_agent_chain
 import traceback
 
 # --- Cấu hình trang và tiêu đề ---
@@ -29,27 +28,34 @@ if prompt := st.chat_input("e.g., Summarize Apple's latest annual report and tec
 
     # --- Chạy Agent và hiển thị kết quả (Sử dụng INVOKE) ---
     with st.chat_message("assistant"):
-        # Spinner cho người dùng biết agent đang làm việc trong nền
         with st.spinner("Agent is running the full analysis... This may take a moment."):
             try:
-                # Lấy lịch sử tin nhắn (trừ tin nhắn cuối cùng của user)
                 history = st.session_state.messages[:-1]
                 
                 # Chạy toàn bộ chuỗi agent và chờ kết quả cuối cùng
                 final_result = run_agent_chain(prompt, history)
                 
-                # Lấy nội dung từ tin nhắn cuối cùng của agent
+                print("--- FINAL AGENT RESULT ---")
+                print(final_result)
+                print("--------------------------")
+                
+                # --- LOGIC MỚI: TÌM CÂU TRẢ LỜI ĐÚNG ---
+                final_response = ""
                 if final_result and final_result.get('messages'):
-                    final_response = final_result['messages'][-1].content
-                else:
-                    final_response = "Sorry, I encountered an issue and couldn't get a final response."
+                    # Lặp ngược từ cuối để tìm tin nhắn cuối cùng CÓ NỘI DUNG của assistant
+                    for msg in reversed(final_result['messages']):
+                        if isinstance(msg, AIMessage) and msg.content.strip():
+                            final_response = msg.content
+                            break # Dừng lại khi tìm thấy
+                
+                if not final_response:
+                    final_response = "Sorry, I ran into an issue and couldn't generate a final report. Please check the logs."
 
                 st.markdown(final_response)
                 st.session_state.messages.append({"role": "assistant", "content": final_response})
 
             except Exception as e:
-                # Xử lý lỗi một cách chi tiết
-                traceback.print_exc() # In lỗi đầy đủ ra terminal để gỡ lỗi
+                traceback.print_exc()
                 error_message = f"An unexpected error occurred: {e}"
                 st.error(error_message)
                 st.session_state.messages.append({"role": "assistant", "content": error_message})
