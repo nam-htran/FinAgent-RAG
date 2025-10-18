@@ -7,8 +7,6 @@
 
 FinAgent Pro is a sophisticated AI-powered agent designed to perform financial analysis of U.S. companies. By leveraging a multi-step, tool-based workflow orchestrated by LangGraph, this agent can retrieve SEC filings, calculate technical stock indicators, and synthesize the information into a concise report. The interactive user interface is built with Streamlit.
 
-*(This is a representative image of the UI)*
-
 ---
 
 ## Features
@@ -66,7 +64,7 @@ This process includes robust error handling to inform the user about any failed 
 ### 2. Clone the Repository
 
 ```bash
-git clone https://github.com/your-username/FinAgent-RAG.git
+git clone https://github.com/nam-htran/FinAgent-RAG
 cd FinAgent-RAG
 ```
 
@@ -108,7 +106,7 @@ OPENROUTER_API_KEY="sk-or-..."
 SEC_USER_AGENT="YourFullName YourEmail@example.com"
 ```
 
-> ⚠️ The SEC requires a valid `User-Agent`. Generic agents like `python-requests` will be blocked.
+> The SEC requires a valid `User-Agent`. Generic agents like `python-requests` will be blocked.
 
 ### 6. Run the Application
 
@@ -141,23 +139,3 @@ The agent will retrieve data, analyze it, and return a summarized report.
 - **Model Comparison UI**: Let users test and compare LLM outputs.
 
 ---
-
-## Contributing
-
-We welcome contributions!
-
-```bash
-# Steps to contribute
-1. Fork the repo
-2. git checkout -b feature/your-feature-name
-3. Make your changes
-4. git commit -m "Add your feature"
-5. git push origin feature/your-feature-name
-6. Open a Pull Request
-```
-
----
-
-## License
-
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
